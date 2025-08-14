@@ -4,8 +4,9 @@ import pandas as pd
 from datetime import date, datetime
 from pathlib import Path
 from fpdf import FPDF
-import base64, re, json, io
+import base64, re, json, io, os
 
+# bidi (לייפות RTL אם קיים)
 try:
     from bidi.algorithm import get_display
 except Exception:
@@ -16,8 +17,26 @@ except Exception:
 # =========================
 st.set_page_config(page_title="מחולל הצעות מחיר", page_icon="📄", layout="wide")
 
-LOGO_FILE = Path("לוגו טללים.JPG")
-FONT_FILE = Path("DejaVuSans.ttf")
+# --- איתור נכסים בצורה חסינת-ענן ---
+APP_DIR = Path(__file__).parent
+
+def asset_path(filename: str) -> Path:
+    """החזר נתיב אמין לנכס (ליד app.py או בתיקיית assets/ או fonts/)."""
+    candidates = [
+        APP_DIR / filename,
+        APP_DIR / "assets" / filename,
+        APP_DIR / "fonts" / filename,
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    # חיפוש רקורסיבי (זול) – פעם אחת
+    for p in APP_DIR.rglob(filename):
+        return p
+    return APP_DIR / filename  # יחזיר נתיב 'לא קיים' – נבדוק בהמשך
+
+LOGO_FILE = asset_path("לוגו טללים.JPG")
+FONT_FILE = asset_path("DejaVuSans.ttf")
 
 st.markdown("""
 <style>
@@ -31,7 +50,6 @@ html, body, [class^="css"] { direction: rtl !important; text-align: right !impor
 #         HELPERS
 # =========================
 def norm_he(txt: str) -> str:
-    """נירמול גרש/גרשיים לעבריים כדי לשפר RTL."""
     if txt is None:
         return ""
     txt = str(txt)
@@ -39,12 +57,11 @@ def norm_he(txt: str) -> str:
     return txt
 
 def heb(s: str) -> str:
-    # bidi נעשה בשלב הציור; כאן רק נירמול
     return norm_he("" if s is None else str(s))
 
 def safe_filename(text: str) -> str:
     text = "" if text is None else str(text)
-    text = re.sub(r"[\\/:*?\"'<>|]", " ", text)  # הסרת תווים בעייתיים
+    text = re.sub(r"[\\/:*?\"'<>|]", " ", text)
     text = re.sub(r"\s+", "_", text.strip())
     text = re.sub(r"_+", "_", text)
     return text or "מסמך"
@@ -73,7 +90,7 @@ def fmt_qty_or_blank(x) -> str:
     if is_blank(x):
         return ""
     try:
-        return f"{float(x):.2f}"  # עשרוני
+        return f"{float(x):.2f}"
     except Exception:
         return ""
 
@@ -84,21 +101,25 @@ def _empty_items_df():
 # =========================
 #  ARCHIVE (S3 or LOCAL)
 # =========================
-# הרעיון: אם יש ב-Secrets מקטע [aws] מלא → עובדים מול S3.
-# אחרת → שומרים/קוראים מקומית בתיקייה proposals.
-import boto3
+# boto3 אופציונלי – לא נכשלים אם לא מותקן
+try:
+    import boto3  # type: ignore
+except Exception:
+    boto3 = None
 
-PROPOSALS_DIR = Path("proposals")
+PROPOSALS_DIR = APP_DIR / "proposals"
 INDEX_FILE = PROPOSALS_DIR / "index.csv"
 INDEX_COLUMNS = ["id","date","client","subject","total","pdf","html","items_json"]
 
 def _new_id():
     return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-def _safe(text):  # לשימוש פנימי לארכיון
+def _safe(text):
     return safe_filename(text or "")
 
 def _has_aws():
+    if boto3 is None:
+        return False
     try:
         aws = st.secrets["aws"]
         return all(aws.get(k) for k in ("access_key","secret_key","region","bucket"))
@@ -214,7 +235,7 @@ def archive_save_local(client_name, subject_text, the_date, total, pdf_bytes, ht
     save_index_local(idx)
     return row
 
-# ---------- Dynamic binding (cloud if secrets exist) ----------
+# ---------- Dynamic binding ----------
 if _has_aws():
     load_index = load_index_cloud
     save_index = save_index_cloud
@@ -240,7 +261,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📚 הצעות קודמות")
 idx = load_index()
 q = st.sidebar.text_input("חיפוש (לקוח/נושא):", "")
-if q.strip():
+if q.strip() and not idx.empty:
     mask = (idx["client"].str.contains(q, case=False)) | (idx["subject"].str.contains(q, case=False))
     idx_view = idx[mask].copy()
 else:
@@ -252,7 +273,7 @@ if not idx_view.empty:
 options = [
     f"{r['date']} · {r['client']} · {r['subject']} · {r['total']}₪"
     for _, r in idx_view.iterrows()
-]
+] if not idx_view.empty else []
 sel = st.sidebar.selectbox("בחר הצעה:", options, index=0 if len(options)>0 else None) if len(options)>0 else None
 
 sel_row = None
@@ -260,7 +281,6 @@ if sel:
     sel_row = idx_view.iloc[options.index(sel)]
     st.sidebar.caption(f"סה\"כ: {sel_row['total']} ₪")
 
-    # הורדות (קורא דרך READ_BYTES; עובד גם בענן וגם מקומית)
     if sel_row.get("pdf"):
         st.sidebar.download_button(
             "⬇️ הורדת PDF",
@@ -278,7 +298,6 @@ if sel:
             use_container_width=True
         )
 
-    # שחזור לטבלה + תצוגה מקדימה
     try:
         data = json.loads(READ_BYTES(sel_row["items_json"]).decode("utf-8"))
         preview_df = pd.DataFrame(data.get("items", []))
@@ -439,7 +458,7 @@ def rtl_x_positions(pdf, col_w):
     for w in col_w:
         run += w
         xs.append(x_right - run)
-    return xs  # xs[i] = X התחלת עמודה i
+    return xs
 
 def draw_table_header_rtl(pdf, headers, col_w):
     xs = rtl_x_positions(pdf, col_w)
@@ -494,9 +513,9 @@ def draw_block_rtl(pdf, x, y, w, h, text, line_h=8, align='R', bg=None, pad_r=0.
             x_text = x + (w - txt_w) / 2.0
         elif align == 'L':
             x_text = x + pad_l
-        else:  # 'R'
+        else:
             x_text = x + w - txt_w - pad_r
-        y_text = y + (i+1) * line_h - 1.6  # tweak לבסליין
+        y_text = y + (i+1) * line_h - 1.6
         pdf.text(x_text, y_text, vis)
 
 def draw_num_block(pdf, x, y, w, h, text, bg=None):
@@ -509,16 +528,18 @@ def draw_num_block(pdf, x, y, w, h, text, bg=None):
     vis = get_display(heb((text or "").strip()))
     txt_w = pdf.get_string_width(vis)
     x_text = x + (w - txt_w) / 2.0
-    y_text = y + (h - 8) / 2.0 + (8 - 1.6)  # line_h=8, tweak לבסליין
+    y_text = y + (h - 8) / 2.0 + (8 - 1.6)
     pdf.text(x_text, y_text, vis)
 
 def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_date):
-    if not FONT_FILE.exists():
-        st.error("נדרש קובץ DejaVuSans.ttf בתיקיית האפליקציה עבור עברית ב־PDF.")
+    # --- תיקון קריטי: מאתרים פונט באופן חסין-ענן ---
+    font_path = FONT_FILE if FONT_FILE.exists() else asset_path("DejaVuSans.ttf")
+    if not font_path.exists():
+        st.error("נדרש קובץ DejaVuSans.ttf בתיקיית האפליקציה עבור עברית ב־PDF. שים אותו ליד app.py או בתוך fonts/.")
         return None
 
     pdf = PDF(orientation="P", unit="mm", format="A4")
-    pdf.add_font('DejaVu', '', str(FONT_FILE), uni=True)
+    pdf.add_font('DejaVu', '', str(font_path), uni=True)
     pdf.set_auto_page_break(auto=False, margin=15)
     pdf.add_page()
     pdf.set_line_width(0.2)
@@ -533,13 +554,13 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     pdf.set_xy(pdf.l_margin, 9)
     pdf.cell(0, 8, get_display(heb(the_date.strftime('%d.%m.%Y'))), align='L')
 
-    # לוגו (קצת יותר גדול)
+    # לוגו
     if LOGO_FILE.exists():
         logo_w = 36
         x_logo = pdf.w - pdf.r_margin - logo_w
         pdf.image(str(LOGO_FILE), x=x_logo, y=6, w=logo_w)
 
-    # כותרת מסמך
+    # כותרת
     pdf.set_y(band_h + 6)
     pdf.set_font('DejaVu', '', 13)
     pdf.cell(0, 8, get_display(heb(f"שם לקוח: {s(client_name)}")), ln=True, align='R')
@@ -547,7 +568,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     title_line = f"הצעת מחיר{': ' + s(subject_text) if s(subject_text) else ''}"
     pdf.cell(0, 10, get_display(heb(title_line)), ln=True, align='R')
 
-    # טבלת פריטים RTL — הסדר שביקשת
+    # טבלה RTL
     headers = ["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"]
     col_w = [46, 34, 18, 28, 64]  # פריט | עלות | כמות | סה"כ | תיאור/הערות
     line_h = 8
@@ -576,7 +597,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 
         y0 = pdf.get_y()
 
-        # ---- מדידה (בלי ציור) לקבלת גובה שורה אחיד ----
+        # מדידת גובה שורה אחיד
         h_name, _ = measure_rtl_height(pdf, name, col_w[0], line_h)
         h_note, _ = measure_rtl_height(pdf, note, col_w[4], line_h)
         h_row = max(line_h, h_name, h_note)
@@ -585,7 +606,6 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
         y0 = pdf.get_y()
         xs = rtl_x_positions(pdf, col_w)
 
-        # ---- ציור בפועל (ללא קווי ביניים) ----
         draw_block_rtl(pdf, xs[0], y0, col_w[0], h_row, name, line_h=line_h, align='R', bg=bg, pad_r=0.0)
         draw_num_block(pdf,  xs[1], y0, col_w[1], h_row, unit_txt, bg=bg)
         draw_num_block(pdf,  xs[2], y0, col_w[2], h_row, qty_txt,  bg=bg)
@@ -594,7 +614,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 
         pdf.set_y(y0 + h_row)
 
-    # קופסת סיכום
+    # סיכום
     pdf.ln(8)
     pdf.set_fill_color(248, 250, 252)
     pdf.set_draw_color(229, 231, 235)
@@ -632,14 +652,23 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 # =========================
 #     BUILD & DOWNLOAD
 # =========================
-safe_client = safe_filename(client_name)
+st.title("📥 יצוא")
+safe_client = safe_filename(st.session_state.get("client_name_val", "")) if False else ""  # placeholder old logic
+# איסוף ערכים מהטופס:
+client_name = st.session_state.get("client_name_val") if False else st.session_state.get("client_name_val", None)
+# בפועל משתמשים במשתנים שכבר מילאת למעלה:
+client_name = st.session_state.get("ignore", None)  # לא רלוונטי – בהמשך בונים שם קובץ מהשדות האמיתיים
+
+# נשתמש בערכים שהוגדרו קודם (client_name, subject_text, today, calc, discount_val, grand_total)
+safe_client = safe_filename(client_name if client_name else st.session_state.get("tmp_client","") or st.session_state.get("items_client","") or st.session_state.get("items_client2","") or "")
+safe_client = safe_filename(client_name) if client_name else safe_client
 safe_subject = safe_filename(subject_text)
-html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subject else f"הצעת_מחיר_{safe_client}.html"
-pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client}.pdf"
+html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.html"
+pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.pdf"
 
 full_html = build_html_doc(client_name, subject_text, calc, discount_val, grand_total,
                            sig_name, sig_contact, sig_company, today)
-pdf_ready = bool(client_name.strip()) and len(calc) > 0
+pdf_ready = bool((client_name or "").strip()) and len(calc) > 0
 pdf_bytes = build_pdf_bytes(client_name, subject_text, calc, discount_val, grand_total, today) if pdf_ready else None
 
 col_dl1, col_dl2, col_dl3 = st.columns([1,1,1])
@@ -659,3 +688,4 @@ with col_dl3:
             st.success(f"נשמר בארכיון: {row['date']} · {row['client']} · {row['subject']}")
         except Exception as e:
             st.error(f"שמירה נכשלה: {e}")
+
