@@ -6,4 +6,5 @@ streamlit>=1.34
 pandas>=2.0
 fpdf2>=2.7
 python-bidi>=0.4
+python-bidi
 boto3>=1.34
