@@ -1,63 +1,72 @@
 # app.py
+# ---------------------------------------
+# מחולל הצעות מחיר: S3-Only + RTL + PDF עברית
+# ---------------------------------------
+from pathlib import Path
+from datetime import date, datetime
+import io, json, re, base64, os
+
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
-from pathlib import Path
 from fpdf import FPDF
-import base64, re, json, io, os
 
-# bidi (לייפות RTL אם קיים)
+# bidi להצגת RTL טובה יותר (אם מותקן)
 try:
     from bidi.algorithm import get_display
 except Exception:
     get_display = lambda s: s
 
 # =========================
-#        UI & GLOBALS
+#      UI & ASSETS (RTL)
 # =========================
 st.set_page_config(page_title="מחולל הצעות מחיר", page_icon="📄", layout="wide")
 
-# --- איתור נכסים בצורה חסינת-ענן ---
 APP_DIR = Path(__file__).parent
 
 def asset_path(filename: str) -> Path:
-    """החזר נתיב אמין לנכס (ליד app.py או בתיקיית assets/ או fonts/)."""
-    candidates = [
-        APP_DIR / filename,
-        APP_DIR / "assets" / filename,
-        APP_DIR / "fonts" / filename,
-    ]
-    for p in candidates:
+    """איתור קובץ נכס יחסית ל-app.py (גם assets/ וגם fonts/)."""
+    for p in [APP_DIR/filename, APP_DIR/"assets"/filename, APP_DIR/"fonts"/filename]:
         if p.exists():
             return p
-    # חיפוש רקורסיבי (זול) – פעם אחת
     for p in APP_DIR.rglob(filename):
         return p
-    return APP_DIR / filename  # יחזיר נתיב 'לא קיים' – נבדוק בהמשך
+    return APP_DIR/filename
 
 LOGO_FILE = asset_path("לוגו טללים.JPG")
-FONT_FILE = asset_path("DejaVuSans.ttf")
+FONT_PATH = asset_path("DejaVuSans.ttf")  # חייב להתקיים
 
 st.markdown("""
 <style>
-html, body, [class^="css"] { direction: rtl !important; text-align: right !important; }
-[data-testid="stDataEditor"] { direction:ltr !important; }
-[data-testid="stDataEditor"] [role="cell"], [data-testid="stDataEditor"] [role="columnheader"] { text-align: left !important; }
+html, body { direction: rtl !important; text-align: right !important; }
+section.main > div { direction: rtl !important; }
+
+/* Data Editor RTL + יישור לימין */
+[data-testid="stDataEditor"] { direction: rtl !important; }
+[data-testid="stDataEditor"] [role="columnheader"],
+[data-testid="stDataEditor"] [role="cell"] { text-align: right !important; }
+[data-testid="stDataEditor"] [role="columnheader"] { font-weight: 700 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # =========================
-#         HELPERS
+#        HELPERS
 # =========================
 def norm_he(txt: str) -> str:
-    if txt is None:
-        return ""
+    if txt is None: return ""
     txt = str(txt)
-    txt = txt.replace('"', '״').replace("'", "׳")
-    return txt
+    return txt.replace('"', '״').replace("'", "׳")
 
 def heb(s: str) -> str:
     return norm_he("" if s is None else str(s))
+
+def is_blank(x) -> bool:
+    if x is None: return True
+    if isinstance(x, float) and pd.isna(x): return True
+    if isinstance(x, str) and x.strip() == "": return True
+    return False
+
+def s(x) -> str:
+    return "" if is_blank(x) else str(x)
 
 def safe_filename(text: str) -> str:
     text = "" if text is None else str(text)
@@ -66,67 +75,28 @@ def safe_filename(text: str) -> str:
     text = re.sub(r"_+", "_", text)
     return text or "מסמך"
 
-def is_blank(x) -> bool:
-    if x is None:
-        return True
-    if isinstance(x, float) and pd.isna(x):
-        return True
-    if isinstance(x, str) and x.strip() == "":
-        return True
-    return False
-
-def s(x) -> str:
-    return "" if is_blank(x) else str(x)
-
 def fmt_money_or_blank(x) -> str:
-    if is_blank(x):
-        return ""
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return ""
+    if is_blank(x): return ""
+    try: return f"{float(x):.2f}"
+    except: return ""
 
 def fmt_qty_or_blank(x) -> str:
-    if is_blank(x):
-        return ""
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return ""
+    if is_blank(x): return ""
+    try: return f"{float(x):.2f}"
+    except: return ""
 
 @st.cache_data
 def _empty_items_df():
     return pd.DataFrame([{"פריט":"", "עלות ליחידה (₪)":None, "כמות":None, "תיאור / הערות":""}])
 
 # =========================
-#  ARCHIVE (S3 or LOCAL)
+#   ARCHIVE (Always S3)
 # =========================
-# boto3 אופציונלי – לא נכשלים אם לא מותקן
-try:
-    import boto3  # type: ignore
-except Exception:
-    boto3 = None
+import boto3
 
-PROPOSALS_DIR = APP_DIR / "proposals"
-INDEX_FILE = PROPOSALS_DIR / "index.csv"
 INDEX_COLUMNS = ["id","date","client","subject","total","pdf","html","items_json"]
+INDEX_KEY = "index/index.csv"
 
-def _new_id():
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-
-def _safe(text):
-    return safe_filename(text or "")
-
-def _has_aws():
-    if boto3 is None:
-        return False
-    try:
-        aws = st.secrets["aws"]
-        return all(aws.get(k) for k in ("access_key","secret_key","region","bucket"))
-    except Exception:
-        return False
-
-# ---------- S3 helpers ----------
 def _s3():
     aws = st.secrets["aws"]
     return boto3.client(
@@ -136,6 +106,9 @@ def _s3():
         region_name=aws["region"],
     )
 
+def _new_id():
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
 def s3_put_bytes(key: str, data: bytes, content_type: str):
     _s3().put_object(Bucket=st.secrets["aws"]["bucket"], Key=key, Body=data, ContentType=content_type)
 
@@ -144,36 +117,39 @@ def s3_get_bytes(key: str) -> bytes:
     return obj["Body"].read()
 
 def s3_presigned(key: str, expires=3600):
-    return _s3().generate_presigned_url(
-        "get_object",
-        Params={"Bucket": st.secrets["aws"]["bucket"], "Key": key},
-        ExpiresIn=expires
-    )
+    return _s3().generate_presigned_url("get_object",
+        Params={"Bucket": st.secrets["aws"]["bucket"], "Key": key}, ExpiresIn=expires)
 
-INDEX_KEY = "index/index.csv"
-
-def load_index_cloud() -> pd.DataFrame:
+def load_index() -> pd.DataFrame:
     try:
         data = s3_get_bytes(INDEX_KEY)
         return pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
     except Exception:
         return pd.DataFrame(columns=INDEX_COLUMNS)
 
-def save_index_cloud(df: pd.DataFrame):
+def save_index(df: pd.DataFrame):
     buf = io.StringIO()
     df.to_csv(buf, index=False, encoding="utf-8")
     s3_put_bytes(INDEX_KEY, buf.getvalue().encode("utf-8"), "text/csv")
 
-def archive_save_cloud(client_name, subject_text, the_date, total, pdf_bytes, html_bytes, items_df):
-    idx = load_index_cloud().copy()
+def archive_save(client_name, subject_text, the_date, total, pdf_bytes, html_bytes, items_df):
+    idx = load_index().copy()
     _id = _new_id()
+
+    def _safe(x):
+        x = "" if x is None else str(x)
+        x = re.sub(r"[\\/:*?\"'<>|]", " ", x)
+        x = re.sub(r"\s+", "_", x.strip())
+        x = re.sub(r"_+", "_", x)
+        return x or "מסמך"
+
     sc, ss = _safe(client_name), _safe(subject_text)
     base = f"{_id}_{sc}" + (f"_{ss}" if ss else "")
     pdf_key  = f"proposals/{base}.pdf"
     html_key = f"proposals/{base}.html"
     json_key = f"proposals/{base}.json"
 
-    if pdf_bytes:  s3_put_bytes(pdf_key, pdf_bytes, "application/pdf")
+    if pdf_bytes:  s3_put_bytes(pdf_key,  pdf_bytes, "application/pdf")
     if html_bytes: s3_put_bytes(html_key, html_bytes, "text/html")
     rows = items_df.to_dict(orient="records")
     s3_put_bytes(json_key, json.dumps({"items": rows}, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
@@ -189,65 +165,13 @@ def archive_save_cloud(client_name, subject_text, the_date, total, pdf_bytes, ht
         "items_json": json_key,
     }
     idx = pd.concat([idx, pd.DataFrame([row])], ignore_index=True)
-    save_index_cloud(idx)
+    save_index(idx)
     return row
 
-# ---------- Local fallback ----------
-def load_index_local():
-    PROPOSALS_DIR.mkdir(exist_ok=True)
-    if INDEX_FILE.exists():
-        try:
-            return pd.read_csv(INDEX_FILE, dtype=str).fillna("")
-        except Exception:
-            pass
-    return pd.DataFrame(columns=INDEX_COLUMNS)
+def READ_BYTES(key: str) -> bytes:
+    return s3_get_bytes(key)
 
-def save_index_local(df: pd.DataFrame):
-    PROPOSALS_DIR.mkdir(exist_ok=True)
-    df.to_csv(INDEX_FILE, index=False, encoding="utf-8")
-
-def archive_save_local(client_name, subject_text, the_date, total, pdf_bytes, html_bytes, items_df):
-    PROPOSALS_DIR.mkdir(exist_ok=True)
-    idx = load_index_local().copy()
-    _id = _new_id()
-    sc, ss = _safe(client_name), _safe(subject_text)
-    base = f"{_id}_{sc}" + (f"_{ss}" if ss else "")
-    pdf_path  = PROPOSALS_DIR / f"{base}.pdf"
-    html_path = PROPOSALS_DIR / f"{base}.html"
-    json_path = PROPOSALS_DIR / f"{base}.json"
-
-    if pdf_bytes:  Path(pdf_path).write_bytes(pdf_bytes)
-    if html_bytes: Path(html_path).write_bytes(html_bytes)
-    rows = items_df.to_dict(orient="records")
-    Path(json_path).write_text(json.dumps({"items": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    row = {
-        "id": _id,
-        "date": pd.to_datetime(the_date).strftime("%Y-%m-%d"),
-        "client": str(client_name or ""),
-        "subject": str(subject_text or ""),
-        "total": f"{float(total):.2f}",
-        "pdf":  str(pdf_path),
-        "html": str(html_path),
-        "items_json": str(json_path),
-    }
-    idx = pd.concat([idx, pd.DataFrame([row])], ignore_index=True)
-    save_index_local(idx)
-    return row
-
-# ---------- Dynamic binding ----------
-if _has_aws():
-    load_index = load_index_cloud
-    save_index = save_index_cloud
-    archive_save = archive_save_cloud
-    READ_BYTES = lambda key_or_path: s3_get_bytes(key_or_path)
-    IS_CLOUD = True
-else:
-    load_index = load_index_local
-    save_index = save_index_local
-    archive_save = archive_save_local
-    READ_BYTES = lambda key_or_path: Path(key_or_path).read_bytes()
-    IS_CLOUD = False
+IS_CLOUD = True
 
 # =========================
 #        SIDEBAR
@@ -281,36 +205,27 @@ if sel:
     sel_row = idx_view.iloc[options.index(sel)]
     st.sidebar.caption(f"סה\"כ: {sel_row['total']} ₪")
 
-    if sel_row.get("pdf"):
-        st.sidebar.download_button(
-            "⬇️ הורדת PDF",
-            data=READ_BYTES(sel_row["pdf"]),
-            file_name=Path(sel_row["pdf"]).name,
-            mime="application/pdf",
-            use_container_width=True
-        )
-    if sel_row.get("html"):
-        st.sidebar.download_button(
-            "⬇️ הורדת HTML",
-            data=READ_BYTES(sel_row["html"]),
-            file_name=Path(sel_row["html"]).name,
-            mime="text/html",
-            use_container_width=True
-        )
+    def _dl(label, key, mime):
+        data = READ_BYTES(key)
+        st.sidebar.download_button(label, data=data, file_name=Path(key).name, mime=mime, use_container_width=True)
 
-    try:
-        data = json.loads(READ_BYTES(sel_row["items_json"]).decode("utf-8"))
-        preview_df = pd.DataFrame(data.get("items", []))
-        if st.sidebar.button("🧩 שחזור פריטים לטבלה", use_container_width=True):
-            st.session_state["items"] = preview_df
-            st.session_state["items_editor"] = preview_df
-            st.sidebar.success("שוחזר לטבלת הפריטים.")
-        if not preview_df.empty:
-            st.sidebar.dataframe(preview_df, use_container_width=True, height=240)
-    except Exception:
-        st.sidebar.caption("לא ניתן להציג תצוגה מקדימה.")
+    if sel_row.get("pdf"):
+        _dl("⬇️ הורדת PDF", sel_row["pdf"], "application/pdf")
+    if sel_row.get("html"):
+        _dl("⬇️ הורדת HTML", sel_row["html"], "text/html")
 else:
     st.sidebar.caption("אין הצעות בארכיון או שלא נבחרה הצעה.")
+
+with st.sidebar.expander("🛠 אבחון S3", expanded=False):
+    try:
+        aws = st.secrets["aws"]
+        st.caption(f"Bucket: {aws['bucket']} | Region: {aws['region']}")
+        test_key = "healthcheck/ping.txt"
+        s3_put_bytes(test_key, b"pong", "text/plain")
+        data = s3_get_bytes(test_key)
+        st.success("S3 OK – כתיבה/קריאה הצליחו.")
+    except Exception as e:
+        st.error(f"S3 ERROR: {e}")
 
 # =========================
 #        MAIN FORM
@@ -328,30 +243,39 @@ st.subheader("פריטים")
 if "items" not in st.session_state:
     st.session_state["items"] = _empty_items_df()
 
+# --- טבלת פריטים עם עמודת סה״כ מחושבת (לא ניתנת לעריכה) ---
+view_df = st.session_state["items"].copy()
+view_df["עלות ליחידה (₪)"] = pd.to_numeric(view_df["עלות ליחידה (₪)"], errors="coerce")
+view_df["כמות"] = pd.to_numeric(view_df["כמות"], errors="coerce")
+view_df["סה\"כ (₪)"] = (view_df["עלות ליחידה (₪)"].fillna(0) * view_df["כמות"].fillna(0)).round(2)
+
 edited = st.data_editor(
-    st.session_state["items"],
+    view_df,
     key="items_editor",
+    column_order=["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"],
     column_config={
         "פריט": st.column_config.TextColumn("פריט", required=True, width="medium"),
         "עלות ליחידה (₪)": st.column_config.NumberColumn("עלות ליחידה (₪)", min_value=0.0, step=0.1, format="%.2f"),
         "כמות": st.column_config.NumberColumn("כמות", min_value=0.0, step=0.1, format="%.2f"),
+        "סה\"כ (₪)": st.column_config.NumberColumn("סה\"כ (₪)", disabled=True, format="%.2f"),
         "תיאור / הערות": st.column_config.TextColumn("תיאור / הערות", width="large"),
     },
     num_rows="dynamic",
     hide_index=True,
     use_container_width=True,
 )
+if isinstance(edited, pd.DataFrame):
+    st.session_state["items"] = edited.drop(columns=["סה\"כ (₪)"], errors="ignore")
 
-df_current = st.session_state.get("items_editor")
-calc = df_current.copy() if isinstance(df_current, pd.DataFrame) else edited.copy()
-
+# --- סכומים ---
+calc = st.session_state["items"].copy()
 calc["עלות ליחידה (₪)"] = pd.to_numeric(calc["עלות ליחידה (₪)"], errors="coerce")
 calc["כמות"] = pd.to_numeric(calc["כמות"], errors="coerce")
 calc["שדה_סהכ"] = calc["עלות ליחידה (₪)"].fillna(0) * calc["כמות"].fillna(0)
 subtotal = float(calc["שדה_סהכ"].sum())
+
 discount_val = st.number_input("הנחה (₪)", value=0.0, min_value=0.0, step=50.0, format="%.2f")
 grand_total = max(subtotal - float(discount_val or 0), 0.0)
-
 st.metric("סה\"כ לתשלום", f"{grand_total:,.2f} ₪")
 
 # =========================
@@ -480,7 +404,7 @@ def wrap_text_rtl(pdf, text, max_w):
     words = logical.split(" ")
     lines, cur = [], ""
     for w in words:
-        test = (w if cur == "" else (cur + " " + w))
+        test = w if cur == "" else (cur + " " + w)
         vis = get_display(test)
         if pdf.get_string_width(vis) <= max_w or cur == "":
             cur = test
@@ -496,53 +420,36 @@ def measure_rtl_height(pdf, text, max_w, line_h):
     return max(line_h, line_h * len(lines)), lines
 
 def draw_block_rtl(pdf, x, y, w, h, text, line_h=8, align='R', bg=None, pad_r=0.0, pad_l=1.2):
-    if bg:
-        pdf.set_fill_color(*bg)
-        pdf.rect(x, y, w, h, style='DF')
-    else:
-        pdf.rect(x, y, w, h, style='D')
-
-    lines = wrap_text_rtl(pdf, text or "", max_w=w - pad_l - pad_r)
-    if not lines:
-        lines = [""]
-
+    if bg: pdf.set_fill_color(*bg); pdf.rect(x, y, w, h, style='DF')
+    else:  pdf.rect(x, y, w, h, style='D')
+    lines = wrap_text_rtl(pdf, text or "", max_w=w - pad_l - pad_r) or [""]
     for i, ln in enumerate(lines):
         vis = get_display(heb(ln)).strip()
         txt_w = pdf.get_string_width(vis)
-        if align == 'C':
-            x_text = x + (w - txt_w) / 2.0
-        elif align == 'L':
-            x_text = x + pad_l
-        else:
-            x_text = x + w - txt_w - pad_r
-        y_text = y + (i+1) * line_h - 1.6
+        x_text = x + (w - txt_w - pad_r) if align=='R' else (x + (w - txt_w)/2.0 if align=='C' else x+pad_l)
+        y_text = y + (i+1)*line_h - 1.6
         pdf.text(x_text, y_text, vis)
 
 def draw_num_block(pdf, x, y, w, h, text, bg=None):
-    if bg:
-        pdf.set_fill_color(*bg)
-        pdf.rect(x, y, w, h, style='DF')
-    else:
-        pdf.rect(x, y, w, h, style='D')
-
+    if bg: pdf.set_fill_color(*bg); pdf.rect(x, y, w, h, style='DF')
+    else:  pdf.rect(x, y, w, h, style='D')
     vis = get_display(heb((text or "").strip()))
     txt_w = pdf.get_string_width(vis)
-    x_text = x + (w - txt_w) / 2.0
-    y_text = y + (h - 8) / 2.0 + (8 - 1.6)
+    x_text = x + (w - txt_w)/2.0
+    y_text = y + (h - 8)/2.0 + (8 - 1.6)
     pdf.text(x_text, y_text, vis)
 
 def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_date):
-    # --- תיקון קריטי: מאתרים פונט באופן חסין-ענן ---
-    font_path = FONT_FILE if FONT_FILE.exists() else asset_path("DejaVuSans.ttf")
-    if not font_path.exists():
-        st.error("נדרש קובץ DejaVuSans.ttf בתיקיית האפליקציה עבור עברית ב־PDF. שים אותו ליד app.py או בתוך fonts/.")
+    if not FONT_PATH.exists():
+        st.error("נדרש קובץ DejaVuSans.ttf בתיקיית האפליקציה (או fonts/).")
         return None
 
     pdf = PDF(orientation="P", unit="mm", format="A4")
-    pdf.add_font('DejaVu', '', str(font_path), uni=True)
+    pdf.add_font('DejaVu', '', str(FONT_PATH), uni=True)
     pdf.set_auto_page_break(auto=False, margin=15)
     pdf.add_page()
     pdf.set_line_width(0.2)
+    pdf.set_draw_color(229, 231, 235)
 
     # פס עליון
     band_h = 28
@@ -554,11 +461,14 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     pdf.set_xy(pdf.l_margin, 9)
     pdf.cell(0, 8, get_display(heb(the_date.strftime('%d.%m.%Y'))), align='L')
 
-    # לוגו
-    if LOGO_FILE.exists():
-        logo_w = 36
-        x_logo = pdf.w - pdf.r_margin - logo_w
-        pdf.image(str(LOGO_FILE), x=x_logo, y=6, w=logo_w)
+    # לוגו (לא מפילים אם חסר)
+    try:
+        if LOGO_FILE.exists():
+            logo_w = 36
+            x_logo = pdf.w - pdf.r_margin - logo_w
+            pdf.image(str(LOGO_FILE), x=x_logo, y=6, w=logo_w)
+    except Exception:
+        pass
 
     # כותרת
     pdf.set_y(band_h + 6)
@@ -570,9 +480,8 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 
     # טבלה RTL
     headers = ["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"]
-    col_w = [46, 34, 18, 28, 64]  # פריט | עלות | כמות | סה"כ | תיאור/הערות
-    line_h = 8
-
+    col_w = [46, 34, 18, 28, 64]  # ניתן לכוונן לפי התוכן
+    line_h = 8.0
     draw_table_header_rtl(pdf, headers, col_w)
 
     row_alt = False
@@ -596,28 +505,22 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
             tot_txt = ""
 
         y0 = pdf.get_y()
-
-        # מדידת גובה שורה אחיד
         h_name, _ = measure_rtl_height(pdf, name, col_w[0], line_h)
         h_note, _ = measure_rtl_height(pdf, note, col_w[4], line_h)
         h_row = max(line_h, h_name, h_note)
 
-        ensure_page_space(pdf, h_row, headers, col_w)
-        y0 = pdf.get_y()
-        xs = rtl_x_positions(pdf, col_w)
+        ensure_page_space(pdf, h_row, headers, col_w); y0 = pdf.get_y(); xs = rtl_x_positions(pdf, col_w)
 
         draw_block_rtl(pdf, xs[0], y0, col_w[0], h_row, name, line_h=line_h, align='R', bg=bg, pad_r=0.0)
         draw_num_block(pdf,  xs[1], y0, col_w[1], h_row, unit_txt, bg=bg)
         draw_num_block(pdf,  xs[2], y0, col_w[2], h_row, qty_txt,  bg=bg)
         draw_num_block(pdf,  xs[3], y0, col_w[3], h_row, tot_txt,  bg=bg)
         draw_block_rtl(pdf, xs[4], y0, col_w[4], h_row, note, line_h=line_h, align='R', bg=bg, pad_r=0.0)
-
         pdf.set_y(y0 + h_row)
 
     # סיכום
     pdf.ln(8)
     pdf.set_fill_color(248, 250, 252)
-    pdf.set_draw_color(229, 231, 235)
     box_h = 20 if discount and discount>0 else 16
     box_w = 96
     ensure_page_space(pdf, box_h + 10, headers, col_w)
@@ -638,11 +541,8 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     pdf.set_font('DejaVu', '', 12)
     pdf.multi_cell(0, 7, get_display(heb("תנאים והערות:\nהמחירים כוללים מע״מ.")), align='R')
     pdf.ln(8)
-
-    pdf.set_draw_color(229, 231, 235)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
     pdf.ln(6)
-
     sig_block = f"בברכה,\n{s(sig_name)}\n{s(sig_contact)}\n{s(sig_company)}"
     pdf.multi_cell(0, 8, get_display(heb(sig_block)), align='C')
 
@@ -652,16 +552,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 # =========================
 #     BUILD & DOWNLOAD
 # =========================
-st.title("📥 יצוא")
-safe_client = safe_filename(st.session_state.get("client_name_val", "")) if False else ""  # placeholder old logic
-# איסוף ערכים מהטופס:
-client_name = st.session_state.get("client_name_val") if False else st.session_state.get("client_name_val", None)
-# בפועל משתמשים במשתנים שכבר מילאת למעלה:
-client_name = st.session_state.get("ignore", None)  # לא רלוונטי – בהמשך בונים שם קובץ מהשדות האמיתיים
-
-# נשתמש בערכים שהוגדרו קודם (client_name, subject_text, today, calc, discount_val, grand_total)
-safe_client = safe_filename(client_name if client_name else st.session_state.get("tmp_client","") or st.session_state.get("items_client","") or st.session_state.get("items_client2","") or "")
-safe_client = safe_filename(client_name) if client_name else safe_client
+safe_client = safe_filename(client_name)
 safe_subject = safe_filename(subject_text)
 html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.html"
 pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.pdf"
@@ -688,4 +579,3 @@ with col_dl3:
             st.success(f"נשמר בארכיון: {row['date']} · {row['client']} · {row['subject']}")
         except Exception as e:
             st.error(f"שמירה נכשלה: {e}")
-
