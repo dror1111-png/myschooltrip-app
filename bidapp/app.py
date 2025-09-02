@@ -1,4 +1,4 @@
-# app.py — מחולל הצעות מחיר: S3-Only + RTL + PDF עברית + טבלה בתוך st.form
+# app.py — מחולל הצעות מחיר: S3-Only + RTL + PDF עברית + טבלה בתוך st.form + הערות נוספות
 from pathlib import Path
 from datetime import date, datetime
 import io, json, re, base64
@@ -158,7 +158,7 @@ def archive_save(client_name, subject_text, the_date, total, pdf_bytes, html_byt
     save_index(idx)
     return row
 
-def READ_BYTES(key: str) -> bytes:  # להורדות מהארכיון
+def READ_BYTES(key: str) -> bytes:
     return s3_get_bytes(key)
 
 # =========================
@@ -210,6 +210,9 @@ with col1:
     subject_text = st.text_input("תיאור ההצעה (יופיע לאחר 'הצעת מחיר:')", "")
 with col2:
     today = st.date_input("תאריך", value=date.today())
+
+# --- הערות נוספות (יופיעו בסוף ההצעה) ---
+extra_notes = st.text_area("הערות נוספות (יופיעו בסוף ההצעה)", "", height=100)
 
 # -------- טבלת פריטים בתוך st.form כדי למנוע rerun על כל הקשה --------
 st.subheader("פריטים")
@@ -292,7 +295,8 @@ def logo_data_tag():
         return f"<img class='logo' src='data:image/{mime};base64,{b64}'/>"
     return ""
 
-def build_html_doc(client_name, subject_text, table_df, discount, total, sig_name, sig_contact, sig_company, the_date):
+def build_html_doc(client_name, subject_text, table_df, discount, total,
+                   sig_name, sig_contact, sig_company, the_date, extra_notes=""):
     rows = []
     for _, r in table_df.iterrows():
         name = s(r.get('פריט',''))
@@ -343,6 +347,7 @@ def build_html_doc(client_name, subject_text, table_df, discount, total, sig_nam
   <div class="card">
     <div style="font-weight:700;">תנאים והערות</div>
     <div>המחירים כוללים מע&quot;מ.</div>
+    {f'<div style="margin-top:6px; white-space:pre-line;">{extra_notes}</div>' if (extra_notes or '').strip() else ''}
   </div>
   <div class="card sign">
     <div class="divider"></div>
@@ -419,7 +424,7 @@ def draw_num_block(pdf, x, y, w, h, text, bg=None):
     y_text = y + (h - 8)/2.0 + (8 - 1.6)
     pdf.text(x_text, y_text, vis)
 
-def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_date):
+def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_date, extra_notes=""):
     if not FONT_PATH.exists():
         st.error("נדרש קובץ DejaVuSans.ttf בתיקיית האפליקציה (או fonts/).")
         return None
@@ -514,11 +519,14 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
         pdf.set_font('DejaVu', '', 11)
         pdf.cell(box_w - 12, 6, get_display(heb(f"הנחה: -{discount:,.2f} ₪")), align='R')
 
-    # תנאים וחתימה
+    # תנאים והערות
     pdf.ln(22)
     ensure_page_space(pdf, 30, headers, col_w)
     pdf.set_font('DejaVu', '', 12)
     pdf.multi_cell(0, 7, get_display(heb("תנאים והערות:\nהמחירים כוללים מע״מ.")), align='R')
+    if (extra_notes or "").strip():
+        pdf.ln(4)
+        pdf.multi_cell(0, 7, get_display(heb(extra_notes)), align='R')
     pdf.ln(8)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
     pdf.ln(6)
@@ -537,9 +545,9 @@ html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subje
 pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.pdf"
 
 full_html = build_html_doc(client_name, subject_text, calc, discount_val, grand_total,
-                           sig_name, sig_contact, sig_company, today)
+                           sig_name, sig_contact, sig_company, today, extra_notes)
 pdf_ready = bool((client_name or "").strip()) and len(calc) > 0
-pdf_bytes = build_pdf_bytes(client_name, subject_text, calc, discount_val, grand_total, today) if pdf_ready else None
+pdf_bytes = build_pdf_bytes(client_name, subject_text, calc, discount_val, grand_total, today, extra_notes) if pdf_ready else None
 
 c1, c2, c3 = st.columns([1,1,1])
 with c1:
