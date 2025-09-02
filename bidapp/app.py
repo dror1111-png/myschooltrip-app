@@ -1,11 +1,15 @@
-# app.py — מחולל הצעות מחיר: S3-Only + RTL + PDF עברית + טבלה בתוך st.form + הערות נוספות
+# app.py — מחולל הצעות מחיר: S3-Only + RTL + PDF עברית
+# כולל: בחירה מרובה מהארכיון, מיזוג PDF, פתיחת HTML בלשונית
+
 from pathlib import Path
 from datetime import date, datetime
-import io, json, re, base64
+import io, json, re, base64, uuid
 
 import streamlit as st
 import pandas as pd
 from fpdf import FPDF
+from PyPDF2 import PdfMerger
+import streamlit.components.v1 as components
 
 # bidi לטקסט RTL ב-PDF (אם זמין)
 try:
@@ -21,6 +25,7 @@ st.set_page_config(page_title="מחולל הצעות מחיר", page_icon="📄"
 APP_DIR = Path(__file__).parent
 
 def asset_path(filename: str) -> Path:
+    """איתור נכס (קובץ/פונט/לוגו) בתיקיה, assets/, fonts/ או בכל העץ."""
     for p in [APP_DIR/filename, APP_DIR/"assets"/filename, APP_DIR/"fonts"/filename]:
         if p.exists():
             return p
@@ -35,11 +40,22 @@ st.markdown("""
 <style>
 html, body { direction: rtl !important; text-align: right !important; }
 section.main > div { direction: rtl !important; }
+
 /* Data Editor RTL + יישור לימין */
 [data-testid="stDataEditor"] { direction: rtl !important; }
 [data-testid="stDataEditor"] [role="columnheader"],
 [data-testid="stDataEditor"] [role="cell"] { text-align: right !important; }
 [data-testid="stDataEditor"] [role="columnheader"] { font-weight: 700 !important; }
+
+/* טיפוגרפיה */
+.h1 { font-size:28px; font-weight:800; margin:0 0 8px; }
+.muted { color:#6b7280; }
+
+/* HTML יצוא — כותרת לא נחתכת */
+.title { 
+  font-size:28px; font-weight:800; margin:0 0 6px 0;
+  word-break: break-word; white-space: normal;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,6 +130,13 @@ def s3_get_bytes(key: str) -> bytes:
     obj = _s3().get_object(Bucket=st.secrets["aws"]["bucket"], Key=key)
     return obj["Body"].read()
 
+def s3_presigned(key: str, expires=3600):
+    return _s3().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": st.secrets["aws"]["bucket"], "Key": key},
+        ExpiresIn=expires
+    )
+
 def load_index() -> pd.DataFrame:
     try:
         data = s3_get_bytes(INDEX_KEY)
@@ -161,6 +184,22 @@ def archive_save(client_name, subject_text, the_date, total, pdf_bytes, html_byt
 def READ_BYTES(key: str) -> bytes:
     return s3_get_bytes(key)
 
+def merge_pdfs_bytes(list_of_pdf_bytes: list[bytes]) -> bytes:
+    """מיזוג מספר PDFs לבייטים של קובץ יחיד."""
+    merger = PdfMerger()
+    for blob in list_of_pdf_bytes:
+        merger.append(io.BytesIO(blob))
+    out = io.BytesIO()
+    merger.write(out)
+    merger.close()
+    return out.getvalue()
+
+def open_current_html_in_new_tab(html_bytes: bytes) -> str:
+    """מעלה HTML זמני ל-S3 ומחזיר קישור חתום לשעה."""
+    key = f"temp/{uuid.uuid4().hex}.html"
+    s3_put_bytes(key, html_bytes, "text/html")
+    return s3_presigned(key, expires=3600)
+
 # =========================
 #        SIDEBAR
 # =========================
@@ -171,6 +210,7 @@ sig_company = st.sidebar.text_input("חברה", "טללים חוויות חינ�
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📚 הצעות קודמות")
+
 idx = load_index()
 q = st.sidebar.text_input("חיפוש (לקוח/נושא):", "")
 if q.strip() and not idx.empty:
@@ -180,24 +220,40 @@ else:
     idx_view = idx.copy()
 if not idx_view.empty:
     idx_view = idx_view.sort_values("id", ascending=False)
-options = [
-    f"{r['date']} · {r['client']} · {r['subject']} · {r['total']}₪"
-    for _, r in idx_view.iterrows()
-] if not idx_view.empty else []
-sel = st.sidebar.selectbox("בחר הצעה:", options, index=0 if len(options)>0 else None) if len(options)>0 else None
-if sel:
-    sel_row = idx_view.iloc[options.index(sel)]
-    st.sidebar.caption(f"סה\"כ: {sel_row['total']} ₪")
-    if sel_row.get("pdf"):
-        st.sidebar.download_button("⬇️ הורדת PDF", data=READ_BYTES(sel_row["pdf"]),
-                                   file_name=Path(sel_row["pdf"]).name, mime="application/pdf",
-                                   use_container_width=True)
-    if sel_row.get("html"):
-        st.sidebar.download_button("⬇️ הורדת HTML", data=READ_BYTES(sel_row["html"]),
-                                   file_name=Path(sel_row["html"]).name, mime="text/html",
-                                   use_container_width=True)
+
+if not idx_view.empty:
+    options = [
+        f"{r['date']} · {r['client']} · {r['subject']} · {r['total']}₪"
+        for _, r in idx_view.iterrows()
+    ]
+    picked = st.sidebar.multiselect("בחר הצעות (אפשר כמה):", options, default=[])
+
+    if picked:
+        rows = [idx_view.iloc[options.index(x)] for x in picked]
+
+        # מזג ל-PDF אחד
+        if st.sidebar.button("🧩 מזג PDFs להורדה", use_container_width=True):
+            blobs = [READ_BYTES(r["pdf"]) for r in rows if str(r.get("pdf") or "").strip()]
+            if blobs:
+                merged = merge_pdfs_bytes(blobs)
+                st.sidebar.download_button(
+                    "⬇️ הורד PDF מאוחד",
+                    data=merged,
+                    file_name=f"proposals_merged_{datetime.now():%Y%m%d_%H%M}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            else:
+                st.sidebar.warning("לא נמצאו PDFs להצעות שנבחרו.")
+
+        # פתיחת HTML בלשונית חדשה לכל נבחרת
+        st.sidebar.markdown("**פתח HTML בלשונית חדשה:**")
+        for r in rows:
+            if str(r.get("html") or "").strip():
+                url = s3_presigned(r["html"], expires=3600)
+                st.sidebar.markdown(f"- [↗ {r['date']} · {r['client']}]({url})", unsafe_allow_html=True)
 else:
-    st.sidebar.caption("אין הצעות בארכיון או שלא נבחרה הצעה.")
+    st.sidebar.caption("אין הצעות בארכיון.")
 
 # =========================
 #        MAIN FORM
@@ -221,7 +277,6 @@ if "items" not in st.session_state:
 
 submitted = False
 with st.form("items_form", clear_on_submit=False):
-    # view_df = עותק לתצוגה עם „סה״כ (₪)” מחושב, בלי להמיר את שדות ההקלדה עצמם
     base_df = st.session_state["items"].copy()
     totals = (
         pd.Series(base_df.get("עלות ליחידה (₪)")).map(_to_float).fillna(0) *
@@ -236,7 +291,6 @@ with st.form("items_form", clear_on_submit=False):
         column_order=["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"],
         column_config={
             "פריט": st.column_config.TextColumn("פריט", required=True, width="medium"),
-            # בלי min/format קשיחים כדי לא לשבור הקלדה ביניים
             "עלות ליחידה (₪)": st.column_config.NumberColumn("עלות ליחידה (₪)", step=0.1),
             "כמות": st.column_config.NumberColumn("כמות", step=0.1),
             "סה\"כ (₪)": st.column_config.NumberColumn("סה\"כ (₪)", disabled=True, format="%.2f"),
@@ -274,7 +328,7 @@ html, body { direction: rtl; text-align: right; font-family: Arial, Helvetica, s
 .header { display:flex; justify-content:space-between; align-items:center; gap:18px; }
 .header .date { font-size:18px; color:#374151; }
 .logo { height:72px; width:auto; border-radius:8px; object-fit:contain; }
-.title { font-size:28px; font-weight:800; margin:0 0 6px 0; }
+.title { font-size:28px; font-weight:800; margin:0 0 6px 0; word-break:break-word; white-space:normal; }
 .subtle { color:#4b5563; }
 .table { width:100%; border-collapse:separate; border-spacing:0; }
 .table th, .table td { border:1px solid #e5e7eb; padding:10px 12px; vertical-align:top; }
@@ -361,7 +415,12 @@ def build_html_doc(client_name, subject_text, table_df, discount, total,
 #         PDF EXPORT
 # =========================
 class PDF(FPDF):
-    pass
+    def footer(self):
+        # פוטר עדין בכל עמוד
+        self.set_y(-12)
+        self.set_font('DejaVu','',9)
+        txt = get_display(heb(f"{date.today():%d.%m.%Y} · עמוד {self.page_no()}"))
+        self.cell(0, 6, txt, align='C')
 
 def rtl_x_positions(pdf, col_w):
     x_right = pdf.w - pdf.r_margin
@@ -379,7 +438,7 @@ def draw_table_header_rtl(pdf, headers, col_w):
     for i, h in enumerate(headers):
         pdf.set_xy(xs[i], pdf.get_y())
         pdf.cell(col_w[i], header_h, get_display(heb(h)), border=1, align='C', fill=True)
-    pdf.ln()
+    pdf.ln(0.7)
 
 def ensure_page_space(pdf, h_needed, headers, col_w):
     if pdf.get_y() + h_needed > (pdf.h - pdf.b_margin):
@@ -455,17 +514,20 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     except Exception:
         pass
 
-    # כותרות
+    # כותרת מסמך (multi-line שלא נחתכת)
     pdf.set_y(band_h + 6)
     pdf.set_font('DejaVu', '', 13)
     pdf.cell(0, 8, get_display(heb(f"שם לקוח: {s(client_name)}")), ln=True, align='R')
-    pdf.set_font('DejaVu', '', 20)
-    title_line = f"הצעת מחיר{': ' + s(subject_text) if s(subject_text) else ''}"
-    pdf.cell(0, 10, get_display(heb(title_line)), ln=True, align='R')
 
-    # טבלה
+    pdf.set_font('DejaVu', '', 18)
+    title_line = f"הצעת מחיר{': ' + s(subject_text) if s(subject_text) else ''}"
+    title_vis = get_display(heb(title_line))
+    pdf.multi_cell(0, 9, title_vis, align='R')
+    pdf.ln(2)
+
+    # טבלה RTL
     headers = ["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"]
-    col_w = [46, 34, 18, 28, 64]
+    col_w = [46, 34, 18, 28, 64]  # סך הכל 190 = רוחב הדף הפנוי
     line_h = 8.0
     draw_table_header_rtl(pdf, headers, col_w)
 
@@ -539,30 +601,4 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 # =========================
 #     BUILD & DOWNLOAD
 # =========================
-safe_client = safe_filename(client_name)
-safe_subject = safe_filename(subject_text)
-html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.html"
-pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.pdf"
-
-full_html = build_html_doc(client_name, subject_text, calc, discount_val, grand_total,
-                           sig_name, sig_contact, sig_company, today, extra_notes)
-pdf_ready = bool((client_name or "").strip()) and len(calc) > 0
-pdf_bytes = build_pdf_bytes(client_name, subject_text, calc, discount_val, grand_total, today, extra_notes) if pdf_ready else None
-
-c1, c2, c3 = st.columns([1,1,1])
-with c1:
-    st.download_button("📥 הורדה כ־HTML", data=full_html.encode("utf-8"),
-                       file_name=html_name, mime="text/html", use_container_width=True)
-with c2:
-    st.download_button("📥 הורדה כ־PDF",
-                       data=(bytes(pdf_bytes) if isinstance(pdf_bytes, bytearray) else (pdf_bytes or b"")),
-                       file_name=pdf_name, mime="application/pdf",
-                       disabled=(pdf_bytes is None), use_container_width=True)
-with c3:
-    if st.button("💾 שמירה בארכיון", type="primary", use_container_width=True, disabled=(pdf_bytes is None)):
-        try:
-            row = archive_save(client_name, subject_text, today, grand_total,
-                               pdf_bytes, full_html.encode("utf-8"), calc)
-            st.success(f"נשמר בארכיון: {row['date']} · {row['client']} · {row['subject']}")
-        except Exception as e:
-            st.error(f"שמירה נכשלה: {e}")
+safe
