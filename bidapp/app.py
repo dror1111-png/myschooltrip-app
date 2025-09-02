@@ -1,16 +1,13 @@
-# app.py
-# ---------------------------------------
-# מחולל הצעות מחיר: S3-Only + RTL + PDF עברית
-# ---------------------------------------
+# app.py — מחולל הצעות מחיר: S3-Only + RTL + PDF עברית + טבלה בתוך st.form
 from pathlib import Path
 from datetime import date, datetime
-import io, json, re, base64, os
+import io, json, re, base64
 
 import streamlit as st
 import pandas as pd
 from fpdf import FPDF
 
-# bidi להצגת RTL טובה יותר (אם מותקן)
+# bidi לטקסט RTL ב-PDF (אם זמין)
 try:
     from bidi.algorithm import get_display
 except Exception:
@@ -24,7 +21,6 @@ st.set_page_config(page_title="מחולל הצעות מחיר", page_icon="📄"
 APP_DIR = Path(__file__).parent
 
 def asset_path(filename: str) -> Path:
-    """איתור קובץ נכס יחסית ל-app.py (גם assets/ וגם fonts/)."""
     for p in [APP_DIR/filename, APP_DIR/"assets"/filename, APP_DIR/"fonts"/filename]:
         if p.exists():
             return p
@@ -33,13 +29,12 @@ def asset_path(filename: str) -> Path:
     return APP_DIR/filename
 
 LOGO_FILE = asset_path("לוגו טללים.JPG")
-FONT_PATH = asset_path("DejaVuSans.ttf")  # חייב להתקיים
+FONT_PATH = asset_path("DejaVuSans.ttf")
 
 st.markdown("""
 <style>
 html, body { direction: rtl !important; text-align: right !important; }
 section.main > div { direction: rtl !important; }
-
 /* Data Editor RTL + יישור לימין */
 [data-testid="stDataEditor"] { direction: rtl !important; }
 [data-testid="stDataEditor"] [role="columnheader"],
@@ -53,8 +48,7 @@ section.main > div { direction: rtl !important; }
 # =========================
 def norm_he(txt: str) -> str:
     if txt is None: return ""
-    txt = str(txt)
-    return txt.replace('"', '״').replace("'", "׳")
+    return str(txt).replace('"', '״').replace("'", "׳")
 
 def heb(s: str) -> str:
     return norm_he("" if s is None else str(s))
@@ -85,6 +79,12 @@ def fmt_qty_or_blank(x) -> str:
     try: return f"{float(x):.2f}"
     except: return ""
 
+def _to_float(sx):
+    """המרה עדינה: תומך בפסיק עשרוני. מחזיר NaN אם לא מספר."""
+    if sx is None: return float("nan")
+    try: return float(str(sx).replace(",", ".").strip())
+    except: return float("nan")
+
 @st.cache_data
 def _empty_items_df():
     return pd.DataFrame([{"פריט":"", "עלות ליחידה (₪)":None, "כמות":None, "תיאור / הערות":""}])
@@ -93,14 +93,12 @@ def _empty_items_df():
 #   ARCHIVE (Always S3)
 # =========================
 import boto3
-
 INDEX_COLUMNS = ["id","date","client","subject","total","pdf","html","items_json"]
 INDEX_KEY = "index/index.csv"
 
 def _s3():
     aws = st.secrets["aws"]
-    return boto3.client(
-        "s3",
+    return boto3.client("s3",
         aws_access_key_id=aws["access_key"],
         aws_secret_access_key=aws["secret_key"],
         region_name=aws["region"],
@@ -115,10 +113,6 @@ def s3_put_bytes(key: str, data: bytes, content_type: str):
 def s3_get_bytes(key: str) -> bytes:
     obj = _s3().get_object(Bucket=st.secrets["aws"]["bucket"], Key=key)
     return obj["Body"].read()
-
-def s3_presigned(key: str, expires=3600):
-    return _s3().generate_presigned_url("get_object",
-        Params={"Bucket": st.secrets["aws"]["bucket"], "Key": key}, ExpiresIn=expires)
 
 def load_index() -> pd.DataFrame:
     try:
@@ -135,25 +129,21 @@ def save_index(df: pd.DataFrame):
 def archive_save(client_name, subject_text, the_date, total, pdf_bytes, html_bytes, items_df):
     idx = load_index().copy()
     _id = _new_id()
-
     def _safe(x):
         x = "" if x is None else str(x)
         x = re.sub(r"[\\/:*?\"'<>|]", " ", x)
         x = re.sub(r"\s+", "_", x.strip())
         x = re.sub(r"_+", "_", x)
         return x or "מסמך"
-
     sc, ss = _safe(client_name), _safe(subject_text)
     base = f"{_id}_{sc}" + (f"_{ss}" if ss else "")
     pdf_key  = f"proposals/{base}.pdf"
     html_key = f"proposals/{base}.html"
     json_key = f"proposals/{base}.json"
-
     if pdf_bytes:  s3_put_bytes(pdf_key,  pdf_bytes, "application/pdf")
     if html_bytes: s3_put_bytes(html_key, html_bytes, "text/html")
     rows = items_df.to_dict(orient="records")
     s3_put_bytes(json_key, json.dumps({"items": rows}, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
-
     row = {
         "id": _id,
         "date": pd.to_datetime(the_date).strftime("%Y-%m-%d"),
@@ -168,10 +158,8 @@ def archive_save(client_name, subject_text, the_date, total, pdf_bytes, html_byt
     save_index(idx)
     return row
 
-def READ_BYTES(key: str) -> bytes:
+def READ_BYTES(key: str) -> bytes:  # להורדות מהארכיון
     return s3_get_bytes(key)
-
-IS_CLOUD = True
 
 # =========================
 #        SIDEBAR
@@ -190,42 +178,26 @@ if q.strip() and not idx.empty:
     idx_view = idx[mask].copy()
 else:
     idx_view = idx.copy()
-
 if not idx_view.empty:
     idx_view = idx_view.sort_values("id", ascending=False)
-
 options = [
     f"{r['date']} · {r['client']} · {r['subject']} · {r['total']}₪"
     for _, r in idx_view.iterrows()
 ] if not idx_view.empty else []
 sel = st.sidebar.selectbox("בחר הצעה:", options, index=0 if len(options)>0 else None) if len(options)>0 else None
-
-sel_row = None
 if sel:
     sel_row = idx_view.iloc[options.index(sel)]
     st.sidebar.caption(f"סה\"כ: {sel_row['total']} ₪")
-
-    def _dl(label, key, mime):
-        data = READ_BYTES(key)
-        st.sidebar.download_button(label, data=data, file_name=Path(key).name, mime=mime, use_container_width=True)
-
     if sel_row.get("pdf"):
-        _dl("⬇️ הורדת PDF", sel_row["pdf"], "application/pdf")
+        st.sidebar.download_button("⬇️ הורדת PDF", data=READ_BYTES(sel_row["pdf"]),
+                                   file_name=Path(sel_row["pdf"]).name, mime="application/pdf",
+                                   use_container_width=True)
     if sel_row.get("html"):
-        _dl("⬇️ הורדת HTML", sel_row["html"], "text/html")
+        st.sidebar.download_button("⬇️ הורדת HTML", data=READ_BYTES(sel_row["html"]),
+                                   file_name=Path(sel_row["html"]).name, mime="text/html",
+                                   use_container_width=True)
 else:
     st.sidebar.caption("אין הצעות בארכיון או שלא נבחרה הצעה.")
-
-with st.sidebar.expander("🛠 אבחון S3", expanded=False):
-    try:
-        aws = st.secrets["aws"]
-        st.caption(f"Bucket: {aws['bucket']} | Region: {aws['region']}")
-        test_key = "healthcheck/ping.txt"
-        s3_put_bytes(test_key, b"pong", "text/plain")
-        data = s3_get_bytes(test_key)
-        st.success("S3 OK – כתיבה/קריאה הצליחו.")
-    except Exception as e:
-        st.error(f"S3 ERROR: {e}")
 
 # =========================
 #        MAIN FORM
@@ -235,42 +207,52 @@ st.title("📄 מחולל הצעות מחיר")
 col1, col2 = st.columns([2,1])
 with col1:
     client_name = st.text_input("שם לקוח / בית ספר *", "")
-    subject_text = st.text_input("תיאור ההצעה (יופיע אחרי 'הצעת מחיר:')", "")
+    subject_text = st.text_input("תיאור ההצעה (יופיע לאחר 'הצעת מחיר:')", "")
 with col2:
     today = st.date_input("תאריך", value=date.today())
 
+# -------- טבלת פריטים בתוך st.form כדי למנוע rerun על כל הקשה --------
 st.subheader("פריטים")
 if "items" not in st.session_state:
     st.session_state["items"] = _empty_items_df()
 
-# --- טבלת פריטים עם עמודת סה״כ מחושבת (לא ניתנת לעריכה) ---
-view_df = st.session_state["items"].copy()
-view_df["עלות ליחידה (₪)"] = pd.to_numeric(view_df["עלות ליחידה (₪)"], errors="coerce")
-view_df["כמות"] = pd.to_numeric(view_df["כמות"], errors="coerce")
-view_df["סה\"כ (₪)"] = (view_df["עלות ליחידה (₪)"].fillna(0) * view_df["כמות"].fillna(0)).round(2)
+submitted = False
+with st.form("items_form", clear_on_submit=False):
+    # view_df = עותק לתצוגה עם „סה״כ (₪)” מחושב, בלי להמיר את שדות ההקלדה עצמם
+    base_df = st.session_state["items"].copy()
+    totals = (
+        pd.Series(base_df.get("עלות ליחידה (₪)")).map(_to_float).fillna(0) *
+        pd.Series(base_df.get("כמות")).map(_to_float).fillna(0)
+    ).round(2)
+    view_df = base_df.copy()
+    view_df["סה\"כ (₪)"] = totals
 
-edited = st.data_editor(
-    view_df,
-    key="items_editor",
-    column_order=["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"],
-    column_config={
-        "פריט": st.column_config.TextColumn("פריט", required=True, width="medium"),
-        "עלות ליחידה (₪)": st.column_config.NumberColumn("עלות ליחידה (₪)", min_value=0.0, step=0.1, format="%.2f"),
-        "כמות": st.column_config.NumberColumn("כמות", min_value=0.0, step=0.1, format="%.2f"),
-        "סה\"כ (₪)": st.column_config.NumberColumn("סה\"כ (₪)", disabled=True, format="%.2f"),
-        "תיאור / הערות": st.column_config.TextColumn("תיאור / הערות", width="large"),
-    },
-    num_rows="dynamic",
-    hide_index=True,
-    use_container_width=True,
-)
-if isinstance(edited, pd.DataFrame):
-    st.session_state["items"] = edited.drop(columns=["סה\"כ (₪)"], errors="ignore")
+    edited = st.data_editor(
+        view_df,
+        key="items_editor",
+        column_order=["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"],
+        column_config={
+            "פריט": st.column_config.TextColumn("פריט", required=True, width="medium"),
+            # בלי min/format קשיחים כדי לא לשבור הקלדה ביניים
+            "עלות ליחידה (₪)": st.column_config.NumberColumn("עלות ליחידה (₪)", step=0.1),
+            "כמות": st.column_config.NumberColumn("כמות", step=0.1),
+            "סה\"כ (₪)": st.column_config.NumberColumn("סה\"כ (₪)", disabled=True, format="%.2f"),
+            "תיאור / הערות": st.column_config.TextColumn("תיאור / הערות", width="large"),
+        },
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+    )
+    submitted = st.form_submit_button("עדכן טבלה", use_container_width=True)
 
-# --- סכומים ---
+# מעדכן את ה-Session רק בלחיצה על הכפתור
+if submitted:
+    st.session_state["items"] = edited[["פריט","עלות ליחידה (₪)","כמות","תיאור / הערות"]]
+
+# -------- סכומים (מחושבים אחרי העריכה) --------
 calc = st.session_state["items"].copy()
-calc["עלות ליחידה (₪)"] = pd.to_numeric(calc["עלות ליחידה (₪)"], errors="coerce")
-calc["כמות"] = pd.to_numeric(calc["כמות"], errors="coerce")
+calc["עלות ליחידה (₪)"] = calc["עלות ליחידה (₪)"].map(_to_float)
+calc["כמות"] = calc["כמות"].map(_to_float)
 calc["שדה_סהכ"] = calc["עלות ליחידה (₪)"].fillna(0) * calc["כמות"].fillna(0)
 subtotal = float(calc["שדה_סהכ"].sum())
 
@@ -409,10 +391,8 @@ def wrap_text_rtl(pdf, text, max_w):
         if pdf.get_string_width(vis) <= max_w or cur == "":
             cur = test
         else:
-            lines.append(cur)
-            cur = w
-    if cur != "":
-        lines.append(cur)
+            lines.append(cur); cur = w
+    if cur != "": lines.append(cur)
     return lines
 
 def measure_rtl_height(pdf, text, max_w, line_h):
@@ -461,7 +441,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     pdf.set_xy(pdf.l_margin, 9)
     pdf.cell(0, 8, get_display(heb(the_date.strftime('%d.%m.%Y'))), align='L')
 
-    # לוגו (לא מפילים אם חסר)
+    # לוגו
     try:
         if LOGO_FILE.exists():
             logo_w = 36
@@ -470,7 +450,7 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     except Exception:
         pass
 
-    # כותרת
+    # כותרות
     pdf.set_y(band_h + 6)
     pdf.set_font('DejaVu', '', 13)
     pdf.cell(0, 8, get_display(heb(f"שם לקוח: {s(client_name)}")), ln=True, align='R')
@@ -478,9 +458,9 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
     title_line = f"הצעת מחיר{': ' + s(subject_text) if s(subject_text) else ''}"
     pdf.cell(0, 10, get_display(heb(title_line)), ln=True, align='R')
 
-    # טבלה RTL
+    # טבלה
     headers = ["פריט", "עלות ליחידה (₪)", "כמות", "סה\"כ (₪)", "תיאור / הערות"]
-    col_w = [46, 34, 18, 28, 64]  # ניתן לכוונן לפי התוכן
+    col_w = [46, 34, 18, 28, 64]
     line_h = 8.0
     draw_table_header_rtl(pdf, headers, col_w)
 
@@ -510,7 +490,6 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
         h_row = max(line_h, h_name, h_note)
 
         ensure_page_space(pdf, h_row, headers, col_w); y0 = pdf.get_y(); xs = rtl_x_positions(pdf, col_w)
-
         draw_block_rtl(pdf, xs[0], y0, col_w[0], h_row, name, line_h=line_h, align='R', bg=bg, pad_r=0.0)
         draw_num_block(pdf,  xs[1], y0, col_w[1], h_row, unit_txt, bg=bg)
         draw_num_block(pdf,  xs[2], y0, col_w[2], h_row, qty_txt,  bg=bg)
@@ -562,16 +541,16 @@ full_html = build_html_doc(client_name, subject_text, calc, discount_val, grand_
 pdf_ready = bool((client_name or "").strip()) and len(calc) > 0
 pdf_bytes = build_pdf_bytes(client_name, subject_text, calc, discount_val, grand_total, today) if pdf_ready else None
 
-col_dl1, col_dl2, col_dl3 = st.columns([1,1,1])
-with col_dl1:
+c1, c2, c3 = st.columns([1,1,1])
+with c1:
     st.download_button("📥 הורדה כ־HTML", data=full_html.encode("utf-8"),
                        file_name=html_name, mime="text/html", use_container_width=True)
-with col_dl2:
+with c2:
     st.download_button("📥 הורדה כ־PDF",
                        data=(bytes(pdf_bytes) if isinstance(pdf_bytes, bytearray) else (pdf_bytes or b"")),
                        file_name=pdf_name, mime="application/pdf",
                        disabled=(pdf_bytes is None), use_container_width=True)
-with col_dl3:
+with c3:
     if st.button("💾 שמירה בארכיון", type="primary", use_container_width=True, disabled=(pdf_bytes is None)):
         try:
             row = archive_save(client_name, subject_text, today, grand_total,
