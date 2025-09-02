@@ -601,4 +601,56 @@ def build_pdf_bytes(client_name, subject_text, table_df, discount, total, the_da
 # =========================
 #     BUILD & DOWNLOAD
 # =========================
-safe
+safe_client = safe_filename(client_name)
+safe_subject = safe_filename(subject_text)
+html_name = f"הצעת_מחיר_{safe_client}_{safe_subject}.html" if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.html"
+pdf_name  = f"הצעת_מחיר_{safe_client}_{safe_subject}.pdf"  if safe_subject else f"הצעת_מחיר_{safe_client or 'לקוח'}.pdf"
+
+full_html = build_html_doc(
+    client_name, subject_text, calc, discount_val, grand_total,
+    sig_name, sig_contact, sig_company, today, extra_notes
+)
+
+pdf_ready = bool((client_name or "").strip()) and len(calc) > 0
+pdf_bytes = build_pdf_bytes(
+    client_name, subject_text, calc, discount_val, grand_total, today, extra_notes
+) if pdf_ready else None
+
+c1, c2, c3, c4 = st.columns([1,1,1,1])
+with c1:
+    st.download_button(
+        "📥 הורדה כ־HTML",
+        data=full_html.encode("utf-8"),
+        file_name=html_name, mime="text/html",
+        use_container_width=True
+    )
+with c2:
+    st.download_button(
+        "📥 הורדה כ־PDF",
+        data=(bytes(pdf_bytes) if isinstance(pdf_bytes, bytearray) else (pdf_bytes or b"")),
+        file_name=pdf_name, mime="application/pdf",
+        disabled=(pdf_bytes is None), use_container_width=True
+    )
+with c3:
+    open_url = open_current_html_in_new_tab(full_html.encode("utf-8"))
+    st.markdown(
+        f'<a href="{open_url}" target="_blank" rel="noopener" '
+        'style="display:block;text-align:center;border:1px solid #e5e7eb;'
+        'padding:0.6rem;border-radius:0.5rem;">↗ פתח HTML בלשונית חדשה</a>',
+        unsafe_allow_html=True
+    )
+with c4:
+    if st.button("💾 שמירה בארכיון", type="primary", use_container_width=True, disabled=(pdf_bytes is None)):
+        try:
+            row = archive_save(
+                client_name, subject_text, today, grand_total,
+                pdf_bytes, full_html.encode("utf-8"), calc
+            )
+            st.success(f"נשמר בארכיון: {row['date']} · {row['client']} · {row['subject']}")
+        except Exception as e:
+            st.error(f"שמירה נכשלה: {e}")
+
+# תצוגה מקדימה (אופציונלי)
+with st.expander("🔎 תצוגה מקדימה (HTML)"):
+    components.html(full_html, height=800, scrolling=True)
+
